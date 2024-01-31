@@ -201,8 +201,48 @@ class ModelForQuestionAnswering(nn.Module):
 
 
 class ModelForQuestionAnsweringV2(nn.Module):
-    def __init__(self):
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        if isinstance(module, nn.Linear):
+            print('!!! 1')
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            print('!!! 2')
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            print('!!! 3')
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def __init__(self, set_additional_embedding):
         super(ModelForQuestionAnsweringV2, self).__init__()
+
+        hidden_size = 768
+        max_vocab_sizes = 512
+        if set_additional_embedding is True:
+            self.initializer_range = 0.003
+            self.seg_embedding = nn.Embedding(max_vocab_sizes, hidden_size)
+            self.seg_embedding.apply(self._init_weights)
+
+            self.col_embedding = nn.Embedding(max_vocab_sizes, hidden_size)
+            self.col_embedding.apply(self._init_weights)
+
+            self.row_embedding = nn.Embedding(max_vocab_sizes, hidden_size)
+            self.row_embedding.apply(self._init_weights)
+
+            self.rank_embedding = nn.Embedding(max_vocab_sizes, hidden_size)
+            self.rank_embedding.apply(self._init_weights)
+
+            self.rank_inv_embedding = nn.Embedding(max_vocab_sizes, hidden_size)
+            self.rank_inv_embedding.apply(self._init_weights)
+        self.set_additional_embedding = set_additional_embedding
+
         config = TapasConfig.from_pretrained('google/tapas-base-finetuned-wtq')
         self.dropout = nn.Dropout(0.4)
         self.qa_model = TapasForQuestionAnswering(config=config)
@@ -210,7 +250,7 @@ class ModelForQuestionAnsweringV2(nn.Module):
         self.row_hidden_layer = ProjectionLayer(hidden_size=config.hidden_size)
         self.col_hidden_layer = ProjectionLayer(hidden_size=config.hidden_size)
 
-        self.encoder = AutoModel.from_pretrained('roberta-base')
+        self.encoder = AutoModel.from_pretrained('xlm-roberta-base')
         self.classifier_token = nn.Linear(config.hidden_size * 3, 2)
 
         self.hidden_agg = nn.Linear(config.hidden_size, config.hidden_size)
@@ -243,25 +283,38 @@ class ModelForQuestionAnsweringV2(nn.Module):
             new_position_embeddings.weight[:original_max_position] = original_position_embeddings.clone()
 
         # 5. 모델에 새로운 포지션 임베딩 설정
-        self.encoder.embeddings.position_embeddings = new_position_embeddings
+        if set_additional_embedding is False:
+            self.encoder.embeddings.position_embeddings = new_position_embeddings
 
     def forward(self,
                 input_ids,
                 token_type_ids=None,
                 position_ids=None,
                 attention_mask=None,
-                row_mask=None,
-                labels=None,
                 labels_column=None,
                 labels_row=None,
                 labels_token=None,
                 labels_agg=None):
-        outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            token_type_ids=torch.zeros_like(input_ids)
-        )
+
+        if self.set_additional_embedding is True and token_type_ids is not None:
+            inputs_embeds = self.encoder.get_input_embeddings()(input_ids)
+            inputs_embeds += self.col_embedding(token_type_ids[:, :, 1])
+            inputs_embeds += self.row_embedding(token_type_ids[:, :, 2])
+            inputs_embeds += self.rank_embedding(token_type_ids[:, :, 3])
+            inputs_embeds += self.rank_inv_embedding(token_type_ids[:, :, 4])
+
+            outputs = self.encoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                token_type_ids=torch.zeros_like(input_ids),
+            )
+        else:
+            outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                token_type_ids=torch.zeros_like(input_ids)
+            )
         pooled_output = outputs.pooler_output
 
         loss_fct = CrossEntropyLoss(ignore_index=-1)
@@ -317,7 +370,7 @@ class ModelForQuestionAnsweringV2(nn.Module):
         predictions = self.classifier_combined(hidden_combined)
         prediction_row = torch.matmul(one_hot_from, predictions)[:, :, 1]
 
-        if labels is None:
+        if labels_token is None:
             predictions = torch.softmax(predictions, dim=-1)
             return prediction_column, prediction_row, predictions[:, :, 1], prediction_agg
         # print(one_hot_to.shape, predictions.shape)
@@ -326,9 +379,13 @@ class ModelForQuestionAnsweringV2(nn.Module):
         loss_row2 = loss_fct(predictions.view(-1, 2), labels_token.view(-1))
 
         loss_column = loss_fct(prediction_column, labels_column)
-        loss_agg = loss_fct(prediction_agg, labels_agg)
+        total_loss = loss_column + loss_row + loss_row2
 
-        total_loss = loss_column + loss_agg + loss_row + loss_row2
+        if labels_agg is not None:
+            loss_agg = loss_fct(prediction_agg, labels_agg)
+            total_loss += loss_agg
+        else:
+            loss_agg = None
 
         return loss_column, loss_row, loss_row2, loss_agg, total_loss
 
